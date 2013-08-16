@@ -3,7 +3,7 @@ import numpy as np
 import pyflann
 
 # covariances of state evolution and observation
-evolution_cov = np.power(np.diag((1e0, 1e0, 1e-1, 1e-1)), 2)
+evolution_cov = np.power(np.diag((1e0, 1e0, 1e-2, 1e-2)), 2)
 
 # this is estimated from keypoint scale
 # observation_cov = np.power(np.diag((1, 1)), 2)
