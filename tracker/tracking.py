@@ -3,17 +3,18 @@ import numpy as np
 import pyflann
 
 # covariances of state evolution and observation
-evolution_cov = np.power(np.diag((1e0, 1e0, 1e-2, 1e-2)), 2)
+evolution_cov = np.power(np.diag((1e0, 1e0, 1e-1, 1e-1)), 2)
 
 # this is estimated from keypoint scale
 # observation_cov = np.power(np.diag((1, 1)), 2)
 
 initial_state = np.array([0, 0, 0, 0])
-initial_covariance = np.power(np.diag((1e8, 1e8, 1e1, 1e1)), 2)
+initial_covariance = np.power(np.diag((1e4, 1e4, 1e1, 1e1)), 2)
 
+D = 1
 state_evolution_mat = np.array([
-    [1, 0, 1, 0,],
-    [0, 1, 0, 1,],
+    [1, 0, D, 0,],
+    [0, 1, 0, D,],
     [0, 0, 1, 0,],
     [0, 0, 0, 1,],
 ], dtype=np.float32)
@@ -90,45 +91,43 @@ class Track(object):
             raise IndexError('Must update track for terminal frame')
             
         if len(self.states) > 0:
-            a_posteriori_state = self.states[-1]
-            a_posteriori_covariance = self.covariances[-1]
+            a_posteriori_state = self.states[-1].copy()
+            a_posteriori_covariance = self.covariances[-1].copy()
         else:
-            a_posteriori_state = initial_state
-            a_posteriori_covariance = initial_covariance
+            a_posteriori_state = initial_state.copy()
+            a_posteriori_covariance = initial_covariance.copy()
         
         F = state_evolution_mat
         H = state_observation_mat
         
         W = evolution_cov
-        V = obs_covariance
-        if V is None:
-            if kp is not None:
-                V = 0.25*kp.scale*kp.scale*np.eye(2)
-            else:
-                V = np.eye(1) # Doesn't really matter since it isn't used
             
         # Predict step
         a_priori_state = F.dot(a_posteriori_state)
         a_priori_covariance = F.dot(a_posteriori_covariance).dot(F.T) + W
-
+        
         # Store predictions
         self._a_priori_states.append(a_priori_state)
         self._a_priori_covariances.append(a_priori_covariance)
 
         # Update
         if kp is not None:
+            V = kp.scale*kp.scale*np.eye(2)
             residual_measuement = np.array(kp.location) - H.dot(a_priori_state)
             residual_covariance = H.dot(a_priori_covariance).dot(H.T) + V
             kalman_gain = a_posteriori_covariance.dot(H.T).dot(np.linalg.inv(residual_covariance))
         
             a_posteriori_state = a_priori_state + kalman_gain.dot(residual_measuement)
             a_posteriori_covariance = (np.eye(kalman_gain.shape[0]) - kalman_gain.dot(H)).dot(a_priori_covariance)
+
+            # HACK!
+            a_posteriori_covariance = 0.5 * (a_posteriori_covariance + a_posteriori_covariance.T)
             
             self.associated_keypoints.append(kp)
         else:
-            a_posteriori_state = a_priori_state
-            a_posteriori_covariance = a_posteriori_covariance
-            
+            a_posteriori_state = a_priori_state.copy()
+            a_posteriori_covariance = a_priori_covariance.copy()
+
         # Record
         self.states.append(a_posteriori_state)
         self.covariances.append(a_posteriori_covariance)

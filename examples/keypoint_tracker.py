@@ -7,10 +7,8 @@ Usage:
 
 Options:
     --no-video                  Do not show video in output.
-    --max-position-sigma=SIGMA  Do not show positions with >SIGMA error in
-                                location. [default: None]
-    --max-velocity-sigma=SIGMA  Do not show positions with >SIGMA error in
-                                velocity. [default: None]
+    --max-position-sigma=SIGMA  Do not show positions with >SIGMA error in location.
+    --max-velocity-sigma=SIGMA  Do not show positions with >SIGMA error in velocity.
 
 Input video can be anything OpenCV can read. Output video is AVI. Keypoints are
 read from an HDF5 file.
@@ -24,7 +22,7 @@ import h5py
 import numpy as np
 from sklearn.cluster import AffinityPropagation
 
-from tracker import Keypoint, Track, Tracking
+from tracker import Keypoint, Track, Tracking, Cluster
 
 def main():
     options = docopt.docopt(__doc__)
@@ -38,6 +36,7 @@ def main():
     tracking = Tracking()
     cluster_tracks = []
     video_writer = None
+    clusters = []
 
     while True:
         # Read in frame image
@@ -47,6 +46,11 @@ def main():
         # If we failed to read in a frame, exit
         if not rv:
             break
+        
+        if options['--no-video']:
+            output_frame = np.zeros_like(frame)
+        else:
+            output_frame = np.copy(frame)
 
         if video_writer is None:
             h, w = frame.shape[:2]
@@ -87,22 +91,86 @@ def main():
             if t.final_frame_idx < frame_idx or t.initial_frame_idx > frame_idx:
                 continue
             frame_states.append(t.states[frame_idx - t.initial_frame_idx])
-            frame_covars.append(t.covariances[frame_idx - t.initial_frame_idx])
+            frame_covars.append(t.covariances[frame_idx - t.initial_frame_idx].copy())
             frame_track_kps.append(t.associated_keypoints[-1])
             
         # Convert states to an array
         frame_states = np.array(frame_states)
-        
-        if options['--no-video']:
-            output_frame = np.zeros_like(frame)
-        else:
-            output_frame = np.copy(frame)
+
+        # PDF of choosing kp uniformly from image
+        h, w = frame.shape[:2]
+        non_cluster_pdf = -30
+
+        # Best existing cluster for each state and the associated PDF
+        state_association = [(-1, non_cluster_pdf),] * frame_states.shape[0]
+
+        # PDF of choosing states from each active cluster
+        for c_idx, cluster in enumerate(clusters):
+            # skip elderly clusters
+            if cluster.last_update_frame_idx != frame_idx - 1:
+                continue
+
+            cluster_mu, cluster_sigma = cluster.predict(frame_idx)
+
+            for s_idx in xrange(len(state_association)):
+                s = frame_states[s_idx,:]
+                c = frame_covars[s_idx]
+                _, current_pdf = state_association[s_idx]
+
+                pdf = mv_gaussian_log_pdf(s, cluster_mu, cluster_sigma + c)[0]
+                if pdf > current_pdf:
+                    state_association[s_idx] = (c_idx, pdf)
+
+        # Go through associations
+        unassigned_states, unassigned_covars = [], []
+        cluster_states = [None,] * len(clusters)
+        for s, c, assoc in zip(frame_states, frame_covars, state_association):
+            c_idx = assoc[0]
+            if c_idx < 0:
+                unassigned_states.append(s)
+                unassigned_covars.append(c)
+                continue
+            
+            if cluster_states[c_idx] is None:
+                cluster_states[c_idx] = [(s, c)]
+            else:
+                cluster_states[c_idx].append((s, c))
+
+        for cluster, assignment in zip(clusters, cluster_states):
+            if assignment is None:
+                if cluster.final_frame_idx >= frame_idx - 3:
+                    cluster.update(frame_idx)
+            else:
+                states = np.array(list(s for s,c in assignment))
+
+                if states.shape[0] >= 2:
+                    sigma = np.cov(states.T)
+                else:
+                    sigma = cluster.covariances[-1].copy()
+
+                mu = np.mean(states, axis=0)
+                for _, cov in assignment:
+                    sigma += cov
+
+                cluster.update(frame_idx, mu, sigma)
+
+                minx, maxx = states[:,0].min(), states[:,0].max()
+                miny, maxy = states[:,1].min(), states[:,1].max()
+
+                if maxx - minx > 300 or maxy - miny > 300:
+                    continue
+
+                cv2.rectangle(output_frame,
+                        (int(minx), int(miny)), (int(maxx), int(maxy)), (0,0,200), lineType=cv2.CV_AA)
+
+                state, cov = cluster.predict(frame_idx)
+                draw_cov(output_frame, cov[:2,:2], state[:2], (0,0,200), lineType=cv2.CV_AA)
 
         # Draw 'o' over each frame state
-        sc = 10
+        sc = 10.0
         filtered_states = []
         filtered_covs = []
-        
+
         for kp, s, c in zip(frame_track_kps, frame_states, frame_covars):
             # Extract sigmas
             sigmas = np.diag(np.linalg.cholesky(c))
@@ -116,9 +184,9 @@ def main():
                 if np.any(sigmas[2:4] > float(options['--max-velocity-sigma'])):
                     continue
 
-            # Only those with keypoints at this frame
-            if kp.frame_idx != frame_idx:
-                continue
+            ## Only those with keypoints at this frame
+            #if kp.frame_idx != frame_idx:
+            #    continue
                 
             # Only those with minimum velocity
             #speed = np.sqrt(np.sum(s[2:4]*s[2:4]))
@@ -129,34 +197,40 @@ def main():
             filtered_covs.append(c)
 
             draw_cov(output_frame, c[:2,:2], s[:2], (255,0,0), lineType=cv2.CV_AA)
-            cv2.line(output_frame, (int(s[0]), int(s[1])), (int(s[0]+sc*s[2]), int(s[1]+sc*s[3])), (0,200,0), lineType=cv2.CV_AA)
+            cv2.line(output_frame, (int(s[0]), int(s[1])), (int(s[0]+sc*s[2]),
+                int(s[1]+sc*s[3])), (0,200,0), lineType=cv2.CV_AA)
             draw_cov(output_frame, sc*sc*c[2:4,2:4], s[:2]+sc*s[2:4], (0,200,0), lineType=cv2.CV_AA)
 
         filtered_states = np.array(filtered_states)
 
         # Cluster unlabelled states
-        cluster_states = np.copy(frame_states)
-        cluster_covs = list(frame_covars)
+        if len(unassigned_states) > 4:
+            cluster_states = np.copy(np.array(unassigned_states))
+            cluster_covs = list(unassigned_covars)
 
-        clustering = AffinityPropagation()
-        labels = clustering.fit_predict(cluster_states)
+            clustering = AffinityPropagation()
+            labels = clustering.fit_predict(cluster_states)
 
-        # Process labels
-        for label in np.unique(labels):
-            label_indices = np.nonzero(labels == label)[0]
-            if label_indices.shape[0] < 3:
-                continue
+            # Process labels
+            for label in np.unique(labels):
+                label_indices = np.nonzero(labels == label)[0]
+                if label_indices.shape[0] < 2:
+                    continue
 
-            label_states = cluster_states[label_indices, :]
-            label_covs = list(cluster_covs[i] for i in label_indices)
-            
-            mu = np.mean(label_states, axis=0)
-            sigma = np.cov(label_states.T)
+                label_states = cluster_states[label_indices, :]
+                label_covs = list(cluster_covs[i] for i in label_indices)
+                
+                mu = np.mean(label_states, axis=0)
+                sigma = np.cov(label_states.T)
 
-            for c in label_covs:
-                sigma += c
+                for c in label_covs:
+                    sigma += c
 
-            draw_cov(output_frame, sigma[:2,:2], mu, (0,0,200), lineType=cv2.CV_AA)
+                new_cluster = Cluster()
+                new_cluster.update(frame_idx, mu, sigma)
+                clusters.append(new_cluster)
+
+                draw_cov(output_frame, sigma[:2,:2], mu, (0,200,200), lineType=cv2.CV_AA)
         
         # Write output
         video_writer.write(output_frame)
@@ -172,8 +246,23 @@ def draw_cov(im, cov, pos, color, nstd=2, **kwargs):
     vals, vecs = eigsorted(cov)
     theta = np.degrees(np.arctan2(*vecs[:,0][::-1]))
 
+    # Skip invalid covariance matrices
+    if np.any(vals <= 0):
+        return
+
     width, height = nstd * np.sqrt(vals)
     cv2.ellipse(im, (int(pos[0]), int(pos[1])), (int(width), int(height)), theta, 0, 360, color, **kwargs)
+
+def mv_gaussian_log_pdf(X, mu, sigma):
+    d = np.linalg.det(sigma)
+    if d < 1e-8:
+        return -np.inf * np.ones(X.shape[0])
+    X = np.atleast_2d(X)
+    sigma_inv = np.linalg.inv(sigma)
+    k = mu.shape[0]
+    norm = (-0.5) * (k*np.log(2*np.pi) + np.log(np.linalg.det(sigma)))
+    rvs = list(norm + (-0.5)*(((x-mu).T).dot(sigma_inv.dot(x-mu))) for x in X)
+    return np.array(rvs)
 
 if __name__ == '__main__':
     main()
